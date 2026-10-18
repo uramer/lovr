@@ -45,6 +45,7 @@ extern StringEntry lovrEventType[];
 extern StringEntry lovrFileAction[];
 extern StringEntry lovrFilterMode[];
 extern StringEntry lovrFoveationLevel[];
+extern StringEntry lovrFoveationMode[];
 extern StringEntry lovrHandPose[];
 extern StringEntry lovrHeadsetDriver[];
 extern StringEntry lovrHorizontalAlign[];

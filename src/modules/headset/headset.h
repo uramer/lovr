@@ -70,6 +70,11 @@ typedef enum {
 } FoveationLevel;
 
 typedef enum {
+  FOVEATION_FIXED,
+  FOVEATION_EYE_TRACKED
+} FoveationMode;
+
+typedef enum {
   PASSTHROUGH_OPAQUE,
   PASSTHROUGH_BLEND,
   PASSTHROUGH_ADD,
@@ -183,8 +188,8 @@ void lovrHeadsetGetDisplayDimensions(uint32_t* width, uint32_t* height);
 float* lovrHeadsetGetRefreshRates(uint32_t* count);
 float lovrHeadsetGetRefreshRate(void);
 bool lovrHeadsetSetRefreshRate(float refreshRate);
-void lovrHeadsetGetFoveation(FoveationLevel* level, bool* dynamic);
-bool lovrHeadsetSetFoveation(FoveationLevel level, bool dynamic);
+void lovrHeadsetGetFoveation(FoveationLevel* level, bool* dynamic, FoveationMode* mode);
+bool lovrHeadsetSetFoveation(FoveationLevel level, bool dynamic, FoveationMode mode);
 bool lovrHeadsetIsHDR(void);
 bool lovrHeadsetIsPassthroughSupported(PassthroughMode mode);
 PassthroughMode lovrHeadsetGetPassthrough(void);
@@ -251,6 +256,7 @@ struct Pass* lovrLayerGetPass(Layer* layer);
 void lovrHeadsetGetVulkanPhysicalDevice(void* instance, uintptr_t physicalDevice);
 uint32_t lovrHeadsetCreateVulkanInstance(void* instanceCreateInfo, void* allocator, uintptr_t instance, void* getInstanceProcAddr);
 uint32_t lovrHeadsetCreateVulkanDevice(void* instance, void* deviceCreateInfo, void* allocatoor, uintptr_t device, void* getInstanceProcAddr);
+bool lovrHeadsetHasRuntimeFoveation(void);
 double lovrHeadsetGetDisplayTime(void);
 double lovrHeadsetGetDisplayPeriod(void);
 double lovrHeadsetGetDeltaTime(void);

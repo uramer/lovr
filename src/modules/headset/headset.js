@@ -117,11 +117,11 @@ var headset = {
     return false;
   },
 
-  lovrHeadsetGetFoveation(level, dynamic) {
+  lovrHeadsetGetFoveation(level, dynamic, mode) {
     return false;
   },
 
-  lovrHeadsetSetFoveation(level, dynamic) {
+  lovrHeadsetSetFoveation(level, dynamic, mode) {
     return false;
   },
 

@@ -57,6 +57,8 @@ typedef struct {
   bool int64;
   bool int16;
   bool int8;
+  bool shadingRate;
+  bool shadingRateLayered;
 } GraphicsFeatures;
 
 typedef struct {
@@ -90,6 +92,7 @@ typedef struct {
   uint32_t instances;
   float anisotropy;
   float pointSize;
+  uint32_t shadingRateTexelSize[2];
 } GraphicsLimits;
 
 typedef struct {
@@ -231,7 +234,8 @@ enum {
   TEXTURE_RENDER    = (1 << 1),
   TEXTURE_STORAGE   = (1 << 2),
   TEXTURE_TRANSFER  = (1 << 3),
-  TEXTURE_FOVEATION = (1 << 4)
+  TEXTURE_FOVEATION = (1 << 4),
+  TEXTURE_SHADING_RATE = (1 << 5)
 };
 
 typedef struct {
@@ -609,6 +613,7 @@ typedef struct {
   Attachment color[4];
   Attachment depth;
   Texture* foveation;
+  Texture* shadingRate;
   uint32_t depthFormat;
   uint32_t samples;
 } Canvas;

@@ -60,6 +60,7 @@ struct gpu_texture {
   bool hostCopy;
   bool imported;
   bool srgb;
+  bool shadingRate;
 };
 
 struct gpu_sampler {
@@ -230,6 +231,7 @@ typedef struct {
   bool timelineSemaphore;
   bool scalarBlockLayout;
   bool foveation;
+  bool shadingRate;
   bool pipelineCacheControl;
   bool memoryBudget;
   bool accelerationStructure;
@@ -276,6 +278,7 @@ static struct {
   VkSemaphore semaphore;
   VkPipelineCache pipelineCache;
   VkDebugUtilsMessengerEXT messenger;
+  VkExtent2D shadingRateTexelSize;
   gpu_allocator allocators[GPU_MEMORY_COUNT];
   uint8_t allocatorLookup[GPU_MEMORY_COUNT];
   mtx_t allocatorLock;
@@ -680,6 +683,7 @@ bool gpu_texture_init(gpu_texture* texture, gpu_texture_info* info) {
   texture->format = info->format;
   texture->hostCopy = false;
   texture->srgb = info->srgb;
+  texture->shadingRate = info->usage & GPU_TEXTURE_SHADING_RATE;
 
   gpu_texture_view_info viewInfo = {
     .source = texture,
@@ -706,7 +710,7 @@ bool gpu_texture_init(gpu_texture* texture, gpu_texture_info* info) {
       (info->type == GPU_TEXTURE_CUBE ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
       (mutableFormat ? (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) : 0),
     .imageType = imageTypes[info->type],
-    .format = convertFormat(texture->format, info->srgb),
+    .format = texture->shadingRate ? VK_FORMAT_R8_UINT : convertFormat(texture->format, info->srgb),
     .extent.width = info->size[0],
     .extent.height = info->size[1],
     .extent.depth = texture->layers ? 1 : info->size[2],
@@ -721,6 +725,7 @@ bool gpu_texture_init(gpu_texture* texture, gpu_texture_info* info) {
       ((info->usage & GPU_TEXTURE_COPY_SRC) ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0) |
       ((info->usage & GPU_TEXTURE_COPY_DST) ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0) |
       ((info->usage & GPU_TEXTURE_FOVEATION) ? VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT : 0) |
+      ((info->usage & GPU_TEXTURE_SHADING_RATE) ? VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR : 0) |
       ((info->usage == GPU_TEXTURE_RENDER) ? VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT : 0)
   };
 
@@ -822,6 +827,7 @@ bool gpu_texture_init_view(gpu_texture* texture, gpu_texture_view_info* info) {
     texture->baseLevel = info->levelIndex;
     texture->format = info->source->format;
     texture->srgb = info->srgb;
+    texture->shadingRate = info->source->shadingRate;
 
     if (info->aspect == 0) {
       texture->aspect = info->source->aspect;
@@ -848,7 +854,8 @@ bool gpu_texture_init_view(gpu_texture* texture, gpu_texture_view_info* info) {
       (((info->usage & GPU_TEXTURE_RENDER) && texture->aspect == VK_IMAGE_ASPECT_COLOR_BIT) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) |
       (((info->usage & GPU_TEXTURE_RENDER) && texture->aspect != VK_IMAGE_ASPECT_COLOR_BIT) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0) |
       ((info->usage & GPU_TEXTURE_STORAGE) && !texture->srgb ? VK_IMAGE_USAGE_STORAGE_BIT : 0) |
-      ((info->usage & GPU_TEXTURE_FOVEATION) ? VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT : 0)
+      ((info->usage & GPU_TEXTURE_FOVEATION) ? VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT : 0) |
+      ((info->usage & GPU_TEXTURE_SHADING_RATE) ? VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR : 0)
   };
 
   if (viewUsage.usage == 0) {
@@ -861,7 +868,7 @@ bool gpu_texture_init_view(gpu_texture* texture, gpu_texture_view_info* info) {
     .pNext = &viewUsage,
     .image = info->source->handle,
     .viewType = type,
-    .format = convertFormat(texture->format, texture->srgb),
+    .format = texture->shadingRate ? VK_FORMAT_R8_UINT : convertFormat(texture->format, texture->srgb),
     .subresourceRange = {
       .aspectMask = texture->aspect,
       .baseMipLevel = info->levelIndex,
@@ -1963,11 +1970,14 @@ bool gpu_pipeline_init_graphics(gpu_pipeline* pipeline, gpu_pipeline_info* info,
     if (info->foveated) {
       pipelineInfo.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT;
     }
+    if (info->shadingRate) {
+      pipelineInfo.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+    }
   } else {
     bool depth = info->depth.format;
     uint32_t colorCount = info->attachmentCount;
-    VkAttachmentDescription2 attachments[6];
-    VkAttachmentReference2 references[6];
+    VkAttachmentDescription2 attachments[7];
+    VkAttachmentReference2 references[7];
 
     for (uint32_t i = 0; i < colorCount; i++) {
       references[i] = (VkAttachmentReference2) {
@@ -2021,8 +2031,37 @@ bool gpu_pipeline_init_graphics(gpu_pipeline* pipeline, gpu_pipeline_info* info,
       };
     }
 
+    VkFragmentShadingRateAttachmentInfoKHR shadingRateInfo;
+
+    if (info->shadingRate) {
+      uint32_t index = colorCount + depth + info->foveated;
+
+      references[index] = (VkAttachmentReference2) {
+        .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+        .attachment = index
+      };
+
+      attachments[index] = (VkAttachmentDescription2) {
+        .sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+        .format = VK_FORMAT_R8_UINT,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .finalLayout = VK_IMAGE_LAYOUT_GENERAL
+      };
+
+      shadingRateInfo = (VkFragmentShadingRateAttachmentInfoKHR) {
+        .sType = VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR,
+        .pFragmentShadingRateAttachment = &references[index],
+        .shadingRateAttachmentTexelSize = state.shadingRateTexelSize
+      };
+    }
+
     VkSubpassDescription2 subpass = {
       .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+      .pNext = info->shadingRate ? &shadingRateInfo : NULL,
       .viewMask = (1 << info->viewCount) - 1,
       .colorAttachmentCount = colorCount,
       .pColorAttachments = &references[0],
@@ -2038,7 +2077,7 @@ bool gpu_pipeline_init_graphics(gpu_pipeline* pipeline, gpu_pipeline_info* info,
           .layout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT
         }
       } : NULL,
-      .attachmentCount = colorCount + depth + info->foveated,
+      .attachmentCount = colorCount + depth + info->foveated + info->shadingRate,
       .pAttachments = attachments,
       .subpassCount = 1,
       .pSubpasses = &subpass
@@ -2051,6 +2090,20 @@ bool gpu_pipeline_init_graphics(gpu_pipeline* pipeline, gpu_pipeline_info* info,
     }
 
     condemn(pipelineInfo.renderPass, VK_OBJECT_TYPE_RENDER_PASS);
+  }
+
+  VkPipelineFragmentShadingRateStateCreateInfoKHR shadingRateState = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR,
+    .pNext = pipelineInfo.pNext,
+    .fragmentSize = { 1, 1 },
+    .combinerOps = {
+      VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+      VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR
+    }
+  };
+
+  if (info->shadingRate) {
+    pipelineInfo.pNext = &shadingRateState;
   }
 
   VkResult result = vkCreateGraphicsPipelines(state.device, state.pipelineCache, 1, &pipelineInfo, NULL, &pipeline->handle);
@@ -2355,11 +2408,23 @@ void gpu_render_begin(gpu_stream* stream, gpu_canvas* canvas, gpu_timestamp_writ
       };
     }
 
+    VkRenderingFragmentShadingRateAttachmentInfoKHR shadingRate;
+
+    if (canvas->shadingRate) {
+      shadingRate = (VkRenderingFragmentShadingRateAttachmentInfoKHR) {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR,
+        .pNext = canvas->foveation ? &foveation : NULL,
+        .imageView = canvas->shadingRate->view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .shadingRateAttachmentTexelSize = state.shadingRateTexelSize
+      };
+    }
+
     uint32_t views = colorAttachmentCount > 0 ? canvas->color[0].texture->layers : canvas->depth.texture->layers;
 
     vkCmdBeginRenderingKHR(stream->commands, &(VkRenderingInfo) {
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-      .pNext = canvas->foveation ? &foveation : NULL,
+      .pNext = canvas->shadingRate ? (void*) &shadingRate : canvas->foveation ? (void*) &foveation : NULL,
       .renderArea = {
         .offset = { canvas->area[0], canvas->area[1] },
         .extent = { canvas->area[2] ? canvas->area[2] : canvas->width, canvas->area[3] ? canvas->area[3] : canvas->height }
@@ -2374,8 +2439,8 @@ void gpu_render_begin(gpu_stream* stream, gpu_canvas* canvas, gpu_timestamp_writ
   } else {
     uint32_t attachmentCount = 0;
     uint32_t colorAttachmentCount = 0;
-    VkAttachmentDescription2 attachments[11];
-    VkAttachmentReference2 references[11];
+    VkAttachmentDescription2 attachments[12];
+    VkAttachmentReference2 references[12];
     bool hasColorResolve = false;
     bool hasDepthResolve = !!canvas->depth.resolve;
     bool depth = !!canvas->depth.texture;
@@ -2487,14 +2552,45 @@ void gpu_render_begin(gpu_stream* stream, gpu_canvas* canvas, gpu_timestamp_writ
     uint32_t referenceCount = (colorAttachmentCount << hasColorResolve) + (depth << hasDepthResolve);
     uint32_t views = colorAttachmentCount > 0 ? canvas->color[0].texture->layers : canvas->depth.texture->layers;
 
+    VkFragmentShadingRateAttachmentInfoKHR shadingRateInfo;
+
+    if (canvas->shadingRate) {
+      uint32_t index = attachmentCount++;
+
+      references[referenceCount] = (VkAttachmentReference2) {
+        .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+        .attachment = index
+      };
+
+      attachments[index] = (VkAttachmentDescription2) {
+        .sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+        .format = VK_FORMAT_R8_UINT,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .finalLayout = VK_IMAGE_LAYOUT_GENERAL
+      };
+
+      shadingRateInfo = (VkFragmentShadingRateAttachmentInfoKHR) {
+        .sType = VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR,
+        .pFragmentShadingRateAttachment = &references[referenceCount],
+        .shadingRateAttachmentTexelSize = state.shadingRateTexelSize
+      };
+    }
+
+    VkSubpassDescriptionDepthStencilResolve depthResolveInfo = {
+      .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
+      .pNext = canvas->shadingRate ? &shadingRateInfo : NULL,
+      .depthResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .stencilResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .pDepthStencilResolveAttachment = &references[referenceCount - 1]
+    };
+
     VkSubpassDescription2 subpass = {
       .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-      .pNext = canvas->depth.resolve ? &(VkSubpassDescriptionDepthStencilResolve) {
-        .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
-        .depthResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
-        .stencilResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
-        .pDepthStencilResolveAttachment = &references[referenceCount - 1]
-      } : NULL,
+      .pNext = canvas->depth.resolve ? (void*) &depthResolveInfo : canvas->shadingRate ? (void*) &shadingRateInfo : NULL,
       .viewMask = (1 << views) - 1,
       .colorAttachmentCount = colorAttachmentCount,
       .pColorAttachments = &references[0],
@@ -2507,7 +2603,7 @@ void gpu_render_begin(gpu_stream* stream, gpu_canvas* canvas, gpu_timestamp_writ
       .pNext = canvas->foveation ? &(VkRenderPassFragmentDensityMapCreateInfoEXT) {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT,
         .fragmentDensityMapAttachment = {
-          .attachment = attachmentCount - 1,
+          .attachment = attachmentCount - 1 - !!canvas->shadingRate,
           .layout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT
         }
       } : NULL,
@@ -2523,8 +2619,8 @@ void gpu_render_begin(gpu_stream* stream, gpu_canvas* canvas, gpu_timestamp_writ
 
     // Framebuffer
 
-    VkImageView images[11];
-    VkClearValue clears[11];
+    VkImageView images[12];
+    VkClearValue clears[12];
     uint32_t imageCount = 0;
 
     for (uint32_t i = 0; i < 4 && canvas->color[i].texture; i++) {
@@ -2551,6 +2647,11 @@ void gpu_render_begin(gpu_stream* stream, gpu_canvas* canvas, gpu_timestamp_writ
     if (canvas->foveation) {
       uint32_t index = imageCount++;
       images[index] = canvas->foveation->view;
+    }
+
+    if (canvas->shadingRate) {
+      uint32_t index = imageCount++;
+      images[index] = canvas->shadingRate->view;
     }
 
     VkFramebufferCreateInfo framebufferInfo = {
@@ -3126,6 +3227,7 @@ bool gpu_init(gpu_config* config) {
       { "VK_EXT_descriptor_indexing", true, &state.extensions.descriptorIndexing },
       { "VK_EXT_scalar_block_layout", true, &state.extensions.scalarBlockLayout },
       { "VK_EXT_fragment_density_map", true, &state.extensions.foveation },
+      { "VK_KHR_fragment_shading_rate", true, &state.extensions.shadingRate },
       { "VK_EXT_pipeline_creation_cache_control", true, &state.extensions.pipelineCacheControl },
       { "VK_EXT_memory_budget", true, &state.extensions.memoryBudget },
       { "VK_EXT_host_image_copy", true, &state.extensions.hostImageCopy },
@@ -3158,10 +3260,22 @@ bool gpu_init(gpu_config* config) {
 
     // Device Info
 
+    VkPhysicalDeviceFragmentShadingRatePropertiesKHR shadingRateProperties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR };
     VkPhysicalDeviceMultiviewProperties multiviewProperties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES };
     VkPhysicalDeviceSubgroupProperties subgroupProperties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, .pNext = &multiviewProperties };
     VkPhysicalDeviceProperties2 properties2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &subgroupProperties };
+
+    if (state.extensions.shadingRate) {
+      multiviewProperties.pNext = &shadingRateProperties;
+    }
+
     vkGetPhysicalDeviceProperties2(state.adapter, &properties2);
+
+    // Prefer 16x16 shading rate texels, within the supported range
+    VkExtent2D minTexelSize = shadingRateProperties.minFragmentShadingRateAttachmentTexelSize;
+    VkExtent2D maxTexelSize = shadingRateProperties.maxFragmentShadingRateAttachmentTexelSize;
+    state.shadingRateTexelSize.width = MIN(MAX(16, minTexelSize.width), maxTexelSize.width);
+    state.shadingRateTexelSize.height = MIN(MAX(16, minTexelSize.height), maxTexelSize.height);
 
     if (config->device) {
       VkPhysicalDeviceProperties* properties = &properties2.properties;
@@ -3213,6 +3327,8 @@ bool gpu_init(gpu_config* config) {
       config->limits->instances = multiviewProperties.maxMultiviewInstanceIndex;
       config->limits->anisotropy = limits->maxSamplerAnisotropy;
       config->limits->pointSize = limits->pointSizeRange[1];
+      config->limits->shadingRateTexelSize[0] = state.shadingRateTexelSize.width;
+      config->limits->shadingRateTexelSize[1] = state.shadingRateTexelSize.height;
     }
 
     config->device->timestampScale = (double) properties2.properties.limits.timestampPeriod * 1e-9;
@@ -3229,6 +3345,7 @@ bool gpu_init(gpu_config* config) {
     VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRenderingFeatures = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR };
     VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalarBlockLayoutFeatures = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT };
     VkPhysicalDeviceFragmentDensityMapFeaturesEXT fragmentDensityMapFeatures = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT };
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR shadingRateFeatures = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR };
     VkPhysicalDevicePipelineCreationCacheControlFeaturesEXT pipelineCreationCacheControlFeatures = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES_EXT };
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bufferDeviceAddressFeatures = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR };
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
@@ -3243,6 +3360,10 @@ bool gpu_init(gpu_config* config) {
 
     if (state.extensions.foveation) {
       CHAIN(supported, fragmentDensityMapFeatures);
+    }
+
+    if (state.extensions.shadingRate) {
+      CHAIN(supported, shadingRateFeatures);
     }
 
     if (state.extensions.atomicFloat) {
@@ -3262,6 +3383,18 @@ bool gpu_init(gpu_config* config) {
     }
 
     vkGetPhysicalDeviceFeatures2(state.adapter, &supported);
+
+    // Fragment density maps and fragment shading rates can't be enabled at the same time.  Density
+    // maps are preferred (OpenXR runtimes that do foveation provide them), unless the config asks
+    // for shading rates.
+    bool supportsDensityMap = state.extensions.foveation && fragmentDensityMapFeatures.fragmentDensityMap;
+    bool supportsShadingRate = state.extensions.shadingRate && shadingRateFeatures.pipelineFragmentShadingRate && shadingRateFeatures.attachmentFragmentShadingRate;
+
+    if (supportsShadingRate && (config->vk.preferShadingRate || !supportsDensityMap)) {
+      state.extensions.foveation = false;
+    } else {
+      state.extensions.shadingRate = false;
+    }
 
     VkPhysicalDeviceFeatures2 enabled = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
 
@@ -3309,6 +3442,13 @@ bool gpu_init(gpu_config* config) {
     if (state.extensions.foveation) {
       // Note: vkGetPhysicalDeviceFeatures2 writes all supported features to fragmentDensityMapFeatures
       CHAIN(enabled, fragmentDensityMapFeatures);
+    }
+
+    if (state.extensions.shadingRate) {
+      shadingRateFeatures.pipelineFragmentShadingRate = true;
+      shadingRateFeatures.primitiveFragmentShadingRate = false;
+      shadingRateFeatures.attachmentFragmentShadingRate = true;
+      CHAIN(enabled, shadingRateFeatures);
     }
 
     if (state.extensions.pipelineCacheControl) {
@@ -3359,6 +3499,8 @@ bool gpu_init(gpu_config* config) {
       config->features->depthClamp = enabled.features.depthClamp;
       config->features->depthResolve = state.extensions.depthResolve;
       config->features->foveation = state.extensions.foveation;
+      config->features->shadingRate = state.extensions.shadingRate;
+      config->features->shadingRateLayered = shadingRateProperties.layeredShadingRateAttachments;
       config->features->rayQuery = state.extensions.rayQuery && state.extensions.accelerationStructure;
       config->features->shaderDrawParameters = shaderDrawParameterFeatures.shaderDrawParameters;
       config->features->indirectDrawFirstInstance = enabled.features.drawIndirectFirstInstance;
@@ -4468,6 +4610,7 @@ static VkPipelineStageFlags2 convertPhase(gpu_phase phase, bool dst) {
   if (phase & GPU_PHASE_CLEAR) flags |= VK_PIPELINE_STAGE_2_CLEAR_BIT_KHR;
   if (phase & GPU_PHASE_BLIT) flags |= VK_PIPELINE_STAGE_2_BLIT_BIT_KHR;
   if (phase & GPU_PHASE_TREE_BUILD) flags |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+  if (phase & GPU_PHASE_SHADING_RATE) flags |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
   return flags;
 }
 
@@ -4489,6 +4632,7 @@ static VkAccessFlags2 convertCache(gpu_cache cache) {
   if (cache & GPU_CACHE_TREE_INPUT) flags |= VK_ACCESS_2_SHADER_READ_BIT_KHR;
   if (cache & GPU_CACHE_TREE_READ) flags |= VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
   if (cache & GPU_CACHE_TREE_WRITE) flags |= VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+  if (cache & GPU_CACHE_SHADING_RATE) flags |= VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
   return flags;
 }
 

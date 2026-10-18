@@ -23,6 +23,12 @@ StringEntry lovrFoveationLevel[] = {
   { 0 }
 };
 
+StringEntry lovrFoveationMode[] = {
+  [FOVEATION_FIXED] = ENTRY("fixed"),
+  [FOVEATION_EYE_TRACKED] = ENTRY("eyetracked"),
+  { 0 }
+};
+
 StringEntry lovrPassthroughMode[] = {
   [PASSTHROUGH_OPAQUE] = ENTRY("opaque"),
   [PASSTHROUGH_BLEND] = ENTRY("blend"),
@@ -269,21 +275,24 @@ static int l_lovrHeadsetGetRefreshRates(lua_State* L) {
 static int l_lovrHeadsetGetFoveation(lua_State* L) {
   FoveationLevel level;
   bool dynamic;
-  lovrHeadsetGetFoveation(&level, &dynamic);
+  FoveationMode mode;
+  lovrHeadsetGetFoveation(&level, &dynamic, &mode);
   luax_pushenum(L, FoveationLevel, level);
   lua_pushboolean(L, dynamic);
-  return 2;
+  luax_pushenum(L, FoveationMode, mode);
+  return 3;
 }
 
 static int l_lovrHeadsetSetFoveation(lua_State* L) {
   if (lua_isnoneornil(L, 1)) {
-    bool success = lovrHeadsetSetFoveation(FOVEATION_NONE, false);
+    bool success = lovrHeadsetSetFoveation(FOVEATION_NONE, false, FOVEATION_FIXED);
     lua_pushboolean(L, success);
     return 1;
   } else {
     FoveationLevel level = luax_checkenum(L, 1, FoveationLevel, NULL);
-    bool dynamic = lua_isnoneornil(L, -1) ? true : lua_toboolean(L, 2);
-    bool success = lovrHeadsetSetFoveation(level, dynamic);
+    bool dynamic = lua_isnoneornil(L, 2) ? true : lua_toboolean(L, 2);
+    FoveationMode mode = luax_checkenum(L, 3, FoveationMode, "fixed");
+    bool success = lovrHeadsetSetFoveation(level, dynamic, mode);
     lua_pushboolean(L, success);
     return 1;
   }

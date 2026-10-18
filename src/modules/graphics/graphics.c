@@ -711,7 +711,8 @@ bool lovrGraphicsInit(GraphicsConfig* config) {
 #if defined(LOVR_VK) && !defined(LOVR_DISABLE_HEADSET)
     .vk.getPhysicalDevice = lovrHeadsetIsConnected() ? lovrHeadsetGetVulkanPhysicalDevice : NULL,
     .vk.createInstance = lovrHeadsetIsConnected() ? lovrHeadsetCreateVulkanInstance : NULL,
-    .vk.createDevice = lovrHeadsetIsConnected() ? lovrHeadsetCreateVulkanDevice : NULL
+    .vk.createDevice = lovrHeadsetIsConnected() ? lovrHeadsetCreateVulkanDevice : NULL,
+    .vk.preferShadingRate = lovrHeadsetIsConnected() && !lovrHeadsetHasRuntimeFoveation()
 #endif
   };
 
@@ -1014,6 +1015,8 @@ void lovrGraphicsGetFeatures(GraphicsFeatures* features) {
   features->int64 = state.features.int64;
   features->int16 = state.features.int16;
   features->int8 = state.features.int8;
+  features->shadingRate = state.features.shadingRate;
+  features->shadingRateLayered = state.features.shadingRateLayered;
 }
 
 void lovrGraphicsGetLimits(GraphicsLimits* limits) {
@@ -1049,6 +1052,8 @@ void lovrGraphicsGetLimits(GraphicsLimits* limits) {
   limits->instances = state.limits.instances;
   limits->anisotropy = state.limits.anisotropy;
   limits->pointSize = state.limits.pointSize;
+  limits->shadingRateTexelSize[0] = state.limits.shadingRateTexelSize[0];
+  limits->shadingRateTexelSize[1] = state.limits.shadingRateTexelSize[1];
 }
 
 void lovrGraphicsGetStats(GraphicsStats* stats) {
@@ -1836,6 +1841,18 @@ bool lovrGraphicsSubmit(Pass** passes, uint32_t count) {
       xrCanvas |= attachment->texture->info.xr || (attachment->resolve && attachment->resolve->info.xr);
     }
 
+    // Shading rate attachment (read-only)
+    if (canvas->shadingRate) {
+      Access access = {
+        .sync = canvas->shadingRate->sync,
+        .object = canvas->shadingRate,
+        .phase = GPU_PHASE_SHADING_RATE,
+        .cache = GPU_CACHE_SHADING_RATE
+      };
+
+      syncResource(&access, access.sync->barrier);
+    }
+
     // Render resources (all read-only)
     for (AccessBlock* block = pass->access[ACCESS_RENDER]; block != NULL; block = block->next) {
       for (uint64_t j = 0; j < block->count; j++) {
@@ -2601,6 +2618,8 @@ Texture* lovrTextureCreate(const TextureInfo* info) {
   lovrCheck(~info->usage & TEXTURE_RENDER || info->type != TEXTURE_3D || !isDepthFormat(info->format), "3D depth textures can not have the 'render' flag");
   lovrCheck((info->format < FORMAT_BC1 || info->format > FORMAT_BC7) || state.features.textureBC, "%s textures are not supported on this GPU", "BC");
   lovrCheck(info->format < FORMAT_ASTC_4x4 || state.features.textureASTC, "%s textures are not supported on this GPU", "ASTC");
+  lovrCheck(~info->usage & TEXTURE_SHADING_RATE || state.features.shadingRate, "Shading rate textures are not supported on this GPU");
+  lovrCheck(~info->usage & TEXTURE_SHADING_RATE || info->format == FORMAT_R8, "Shading rate textures must use the r8 format");
   lovrCheck(info->type != TEXTURE_3D || info->imageCount == 0 || lovrImageGetLevelCount(info->images[0]) == 1, "Images used to initialize 3D textures can not have mipmaps");
 
   Texture* texture = lovrCalloc(sizeof(Texture) + gpu_sizeof_texture());
@@ -2627,6 +2646,7 @@ Texture* lovrTextureCreate(const TextureInfo* info) {
       ((info->usage & TEXTURE_STORAGE) ? GPU_TEXTURE_STORAGE : 0) |
       ((info->usage & TEXTURE_TRANSFER) ? GPU_TEXTURE_COPY_SRC | GPU_TEXTURE_COPY_DST : 0) |
       ((info->usage & TEXTURE_FOVEATION) ? GPU_TEXTURE_FOVEATION : 0) |
+      ((info->usage & TEXTURE_SHADING_RATE) ? GPU_TEXTURE_SHADING_RATE : 0) |
       ((info->imageCount > 0) ? GPU_TEXTURE_UPLOAD : 0) |
       ((info->imageCount > 0 && lovrImageGetLevelCount(info->images[0]) < mipmaps) ? GPU_TEXTURE_COPY_SRC | GPU_TEXTURE_COPY_DST : 0),
     .srgb = srgb,
@@ -6921,6 +6941,7 @@ void lovrPassReset(Pass* pass) {
   pass->pipeline->info.multisample.count = canvas->samples;
   pass->pipeline->info.viewCount = pass->views;
   pass->pipeline->info.foveated = canvas->foveation;
+  pass->pipeline->info.shadingRate = canvas->shadingRate;
 
   pass->cameraCount = 0;
   pass->viewportCount = 0;
@@ -6987,6 +7008,7 @@ bool lovrPassSetCanvas(Pass* pass, Canvas* canvas) {
     lovrRelease(canvas->depth.texture, lovrTextureDestroy);
     lovrRelease(canvas->depth.resolve, lovrTextureDestroy);
     lovrRelease(canvas->foveation, lovrTextureDestroy);
+    lovrRelease(canvas->shadingRate, lovrTextureDestroy);
     memset(canvas, 0, sizeof(Canvas));
     pass->width = 0;
     pass->height = 0;
@@ -7154,6 +7176,9 @@ bool lovrPassSetCanvas(Pass* pass, Canvas* canvas) {
   lovrRelease(pass->canvas.foveation, lovrTextureDestroy);
   lovrRetain(canvas->foveation);
 
+  lovrRelease(pass->canvas.shadingRate, lovrTextureDestroy);
+  lovrRetain(canvas->shadingRate);
+
   pass->canvas = *canvas;
   pass->canvas.samples = samples;
   pass->width = texture->width;
@@ -7202,6 +7227,7 @@ bool lovrPassSetCanvas(Pass* pass, Canvas* canvas) {
   }
 
   target->foveation = canvas->foveation ? canvas->foveation->gpu : NULL;
+  target->shadingRate = canvas->shadingRate ? canvas->shadingRate->gpu : NULL;
 
   lovrPassReset(pass);
   return true;

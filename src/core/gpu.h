@@ -179,7 +179,8 @@ enum {
   GPU_TEXTURE_COPY_SRC  = (1 << 3),
   GPU_TEXTURE_COPY_DST  = (1 << 4),
   GPU_TEXTURE_FOVEATION = (1 << 5),
-  GPU_TEXTURE_UPLOAD    = (1 << 6)
+  GPU_TEXTURE_UPLOAD    = (1 << 6),
+  GPU_TEXTURE_SHADING_RATE = (1 << 7)
 };
 
 typedef enum {
@@ -616,6 +617,7 @@ typedef struct {
   uint32_t attachmentCount;
   uint32_t viewCount;
   bool foveated;
+  bool shadingRate;
   const char* label;
 } gpu_pipeline_info;
 
@@ -680,6 +682,7 @@ typedef struct {
   gpu_color_attachment color[4];
   gpu_depth_attachment depth;
   gpu_texture* foveation;
+  gpu_texture* shadingRate;
   gpu_tally* pixelTally;
   uint32_t width;
   uint32_t height;
@@ -705,7 +708,8 @@ typedef enum {
   GPU_PHASE_COPY = (1 << 9),
   GPU_PHASE_CLEAR = (1 << 10),
   GPU_PHASE_BLIT = (1 << 11),
-  GPU_PHASE_TREE_BUILD = (1 << 12)
+  GPU_PHASE_TREE_BUILD = (1 << 12),
+  GPU_PHASE_SHADING_RATE = (1 << 13)
 } gpu_phase;
 
 typedef enum {
@@ -725,6 +729,7 @@ typedef enum {
   GPU_CACHE_TREE_INPUT  = (1 << 13),
   GPU_CACHE_TREE_READ  = (1 << 14),
   GPU_CACHE_TREE_WRITE  = (1 << 15),
+  GPU_CACHE_SHADING_RATE = (1 << 16),
   GPU_CACHE_WRITE_MASK =
     GPU_CACHE_STORAGE_WRITE |
     GPU_CACHE_DEPTH_WRITE |
@@ -805,6 +810,8 @@ typedef struct {
   bool depthClamp;
   bool depthResolve;
   bool foveation;
+  bool shadingRate;
+  bool shadingRateLayered;
   bool rayQuery;
   bool shaderDrawParameters;
   bool indirectDrawFirstInstance;
@@ -856,6 +863,7 @@ typedef struct {
   uint32_t instances;
   float anisotropy;
   float pointSize;
+  uint32_t shadingRateTexelSize[2];
 } gpu_limits;
 
 typedef struct {
@@ -873,6 +881,7 @@ typedef struct {
   struct {
     uint32_t (*createInstance)(void* instanceCreateInfo, void* allocator, uintptr_t instance, void* getInstanceProcAddr);
     void (*getPhysicalDevice)(void* instance, uintptr_t physicalDevice);
+    bool preferShadingRate;
     uint32_t (*createDevice)(void* instance, void* devceCreateInfo, void* allocator, uintptr_t device, void* getInstanceProcAddr);
     void* cacheData;
     size_t cacheSize;

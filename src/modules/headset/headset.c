@@ -274,6 +274,13 @@ static struct {
   mtx_t modelLock;
   FoveationLevel foveationLevel;
   bool foveationDynamic;
+  FoveationMode foveationMode;
+  bool shadingRate;
+  bool shadingRateLayered;
+  Texture* shadingRateTexture;
+  Image* shadingRateImage;
+  float lastGaze[3];
+  bool lastGazeValid;
   XrPassthroughFB passthrough;
   XrPassthroughLayerFB passthroughLayerHandle;
   bool passthroughActive;
@@ -291,6 +298,7 @@ static struct {
     bool foveatedInset;
     bool foveation;
     bool foveationConfig;
+    bool foveationEyeTracked;
     bool foveationVulkan;
     bool frameController;
     bool gaze;
@@ -352,6 +360,7 @@ static XrTime getCurrentXrTime(void);
 static bool updateViewSize(void);
 static XrViewStateFlags locateViews(XrView views[4], uint32_t* count);
 static bool createSwapchains(void);
+static void updateShadingRate(XrView* views, uint32_t count, XrViewStateFlags flags);
 static bool createReferenceSpace(XrTime time);
 static XrAction getPoseActionForDevice(Device device);
 static XrHandTrackerEXT getHandTracker(Device device);
@@ -506,6 +515,7 @@ bool lovrHeadsetConnect(void) {
     { "XR_FB_touch_controller_pro", &state.extensions.touchPro, true },
     { "XR_LOGITECH_mx_ink_stylus_interaction", &state.extensions.mxInk, true },
     { "XR_META_automatic_layer_filter", &state.extensions.layerAutoFilter, true },
+    { "XR_META_foveation_eye_tracked", &state.extensions.foveationEyeTracked, true },
     { "XR_META_hand_tracking_microgestures", &state.extensions.microgestures, true },
     { "XR_META_passthrough_preferences", &state.extensions.passthroughPreferences, true },
     { "XR_META_recommended_layer_resolution", &state.extensions.dynamicResolution, config->dynamicResolution },
@@ -617,6 +627,7 @@ bool lovrHeadsetConnect(void) {
   XrSystemKeyboardTrackingPropertiesFB keyboardTrackingProperties = { .type = XR_TYPE_SYSTEM_KEYBOARD_TRACKING_PROPERTIES_FB };
   XrSystemUserPresencePropertiesEXT presenceProperties = { .type = XR_TYPE_SYSTEM_USER_PRESENCE_PROPERTIES_EXT };
   XrSystemPassthroughProperties2FB passthroughProperties = { .type = XR_TYPE_SYSTEM_PASSTHROUGH_PROPERTIES2_FB };
+  XrSystemFoveationEyeTrackedPropertiesMETA foveationEyeTrackedProperties = { .type = XR_TYPE_SYSTEM_FOVEATION_EYE_TRACKED_PROPERTIES_META };
 
   if (state.extensions.gaze) {
     eyeGazeProperties.next = state.systemProperties.next;
@@ -648,6 +659,11 @@ bool lovrHeadsetConnect(void) {
     state.systemProperties.next = &passthroughProperties;
   }
 
+  if (state.extensions.foveationEyeTracked) {
+    foveationEyeTrackedProperties.next = state.systemProperties.next;
+    state.systemProperties.next = &foveationEyeTrackedProperties;
+  }
+
   XRG(xrGetSystemProperties(state.instance, state.system, &state.systemProperties), "xrGetSystemProperties", fail);
   state.extensions.gaze = eyeGazeProperties.supportsEyeGazeInteraction;
   state.extensions.handTracking = handTrackingProperties.supportsHandTracking;
@@ -655,6 +671,7 @@ bool lovrHeadsetConnect(void) {
   state.extensions.keyboardTracking = keyboardTrackingProperties.supportsKeyboardTracking;
   state.extensions.presence = presenceProperties.supportsUserPresence;
   state.extensions.questPassthrough = passthroughProperties.capabilities & XR_PASSTHROUGH_CAPABILITY_BIT_FB;
+  state.extensions.foveationEyeTracked = foveationEyeTrackedProperties.supportsFoveationEyeTracked;
 
   // View Configuration
 
@@ -956,6 +973,10 @@ bool lovrHeadsetIsConnected(void) {
   return state.system;
 }
 
+bool lovrHeadsetHasRuntimeFoveation(void) {
+  return state.extensions.foveation;
+}
+
 const char* lovrHeadsetGetName(void) {
   return state.system ? state.systemProperties.systemName : NULL;
 }
@@ -1189,6 +1210,10 @@ bool lovrHeadsetStart(void) {
     lovrAssertGoto(stop, supportsColor, "This VR runtime does not support sRGB rgba8 textures");
     if (!supportsDepth || !features.depthResolve) state.extensions.depth = false;
 
+    // Without runtime foveation, foveation can be done with GPU fragment shading rates
+    state.shadingRate = !state.extensions.foveation && features.shadingRate;
+    state.shadingRateLayered = features.shadingRateLayered;
+
     if (!createSwapchains()) {
       goto stop;
     }
@@ -1294,6 +1319,11 @@ void lovrHeadsetStop(void) {
 
   lovrSwapchainDestroy(&state.swapchains[0]);
   lovrSwapchainDestroy(&state.swapchains[1]);
+  lovrRelease(state.shadingRateTexture, lovrTextureDestroy);
+  lovrRelease(state.shadingRateImage, lovrImageDestroy);
+  state.shadingRateTexture = NULL;
+  state.shadingRateImage = NULL;
+  state.lastGazeValid = false;
   lovrRelease(state.pass, lovrPassDestroy);
   state.pass = NULL;
 
@@ -1557,17 +1587,39 @@ float* lovrHeadsetGetRefreshRates(uint32_t* count) {
   return state.refreshRates;
 }
 
-void lovrHeadsetGetFoveation(FoveationLevel* level, bool* dynamic) {
+void lovrHeadsetGetFoveation(FoveationLevel* level, bool* dynamic, FoveationMode* mode) {
   *level = state.foveationLevel;
   *dynamic = state.foveationDynamic;
+  *mode = state.foveationMode;
 }
 
-bool lovrHeadsetSetFoveation(FoveationLevel level, bool dynamic) {
+bool lovrHeadsetSetFoveation(FoveationLevel level, bool dynamic, FoveationMode mode) {
+  if (state.session && state.shadingRate) {
+    if (mode == FOVEATION_EYE_TRACKED && !state.extensions.gaze) {
+      lovrLog(LOG_WARN, "XR", "Eye tracked foveation unavailable (XR_EXT_eye_gaze_interaction missing or unsupported by system)");
+      return false;
+    }
+
+    // The shading rate map is regenerated every frame, dynamic levels are not supported
+    state.foveationLevel = level;
+    state.foveationDynamic = dynamic;
+    state.foveationMode = mode;
+    return true;
+  }
+
   if (!state.session || !state.extensions.foveation) {
+    if (level != FOVEATION_NONE) {
+      lovrLog(LOG_WARN, "XR", "Foveation unavailable (session: %d, XR_FB_foveation: %d)", state.session != XR_NULL_HANDLE, state.extensions.foveation);
+    }
     return level == FOVEATION_NONE;
   }
 
-  if (state.foveationLevel == level && state.foveationDynamic == dynamic) {
+  if (mode == FOVEATION_EYE_TRACKED && !state.extensions.foveationEyeTracked) {
+    lovrLog(LOG_WARN, "XR", "Eye tracked foveation unavailable (XR_META_foveation_eye_tracked missing or unsupported by system)");
+    return false;
+  }
+
+  if (state.foveationLevel == level && state.foveationDynamic == dynamic && state.foveationMode == mode) {
     return true;
   }
 
@@ -1589,13 +1641,24 @@ bool lovrHeadsetSetFoveation(FoveationLevel level, bool dynamic) {
     profileInfo.dynamic = XR_FOVEATION_DYNAMIC_DISABLED_FB;
   }
 
+  XrFoveationEyeTrackedProfileCreateInfoMETA eyeTrackedInfo = {
+    .type = XR_TYPE_FOVEATION_EYE_TRACKED_PROFILE_CREATE_INFO_META
+  };
+
+  if (mode == FOVEATION_EYE_TRACKED) {
+    profileInfo.next = &eyeTrackedInfo;
+  }
+
   XrFoveationProfileCreateInfoFB info = {
     .type = XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB,
     .next = &profileInfo
   };
 
   XrFoveationProfileFB profile;
-  if (XR_FAILED(xrCreateFoveationProfileFB(state.session, &info, &profile))) {
+  XrResult result = xrCreateFoveationProfileFB(state.session, &info, &profile);
+  if (XR_FAILED(result)) {
+    xrthrow(result, "xrCreateFoveationProfileFB");
+    lovrLog(LOG_WARN, "XR", "%s", lovrGetError());
     return false;
   }
 
@@ -1604,7 +1667,11 @@ bool lovrHeadsetSetFoveation(FoveationLevel level, bool dynamic) {
     .profile = profile
   };
 
-  if (XR_FAILED(xrUpdateSwapchainFB(state.swapchains[SWAPCHAIN_COLOR].handle, (XrSwapchainStateBaseHeaderFB*) &foveationState))) {
+  result = xrUpdateSwapchainFB(state.swapchains[SWAPCHAIN_COLOR].handle, (XrSwapchainStateBaseHeaderFB*) &foveationState);
+  if (XR_FAILED(result)) {
+    xrthrow(result, "xrUpdateSwapchainFB");
+    lovrLog(LOG_WARN, "XR", "%s", lovrGetError());
+    xrDestroyFoveationProfileFB(profile);
     return false;
   }
 
@@ -1612,6 +1679,7 @@ bool lovrHeadsetSetFoveation(FoveationLevel level, bool dynamic) {
 
   state.foveationLevel = level;
   state.foveationDynamic = dynamic;
+  state.foveationMode = mode;
 
   return true;
 }
@@ -3007,7 +3075,11 @@ bool lovrHeadsetGetPass(Pass** pass) {
     return true;
   }
 
-  canvas.foveation = state.foveationLevel ? state.swapchains[SWAPCHAIN_COLOR].foveationTextures[state.swapchains[SWAPCHAIN_COLOR].textureIndex] : NULL;
+  if (state.shadingRate) {
+    canvas.shadingRate = state.foveationLevel ? state.shadingRateTexture : NULL;
+  } else {
+    canvas.foveation = state.foveationLevel ? state.swapchains[SWAPCHAIN_COLOR].foveationTextures[state.swapchains[SWAPCHAIN_COLOR].textureIndex] : NULL;
+  }
 
   if (!lovrPassSetCanvas(state.pass, &canvas)) {
     return false;
@@ -3026,6 +3098,10 @@ bool lovrHeadsetGetPass(Pass** pass) {
   uint32_t count;
   XrView views[4];
   XrViewStateFlags flags = locateViews(views, &count);
+
+  if (canvas.shadingRate) {
+    updateShadingRate(views, count, flags);
+  }
 
   for (uint32_t i = 0; i < count; i++) {
     state.layerViews[i].pose = views[i].pose;
@@ -3781,6 +3857,113 @@ static XrViewStateFlags locateViews(XrView views[4], uint32_t* count) {
   return viewState.viewStateFlags;
 }
 
+// Fills the shading rate texture with full rate shading near the gaze direction (or the center of
+// each view, for fixed foveation), and coarser shading further away from it.
+static void updateShadingRate(XrView* views, uint32_t count, XrViewStateFlags flags) {
+  if (!(flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+    return;
+  }
+
+  // Angles (in degrees) away from the gaze direction where shading switches to 2x2 and 4x4 pixels
+  static const float angles[][2] = {
+    [FOVEATION_LOW] = { 20.f, 180.f },
+    [FOVEATION_MEDIUM] = { 15.f, 30.f },
+    [FOVEATION_HIGH] = { 10.f, 20.f }
+  };
+
+  // Fragment shading rates are encoded as log2(width) << 2 | log2(height)
+  enum { RATE_1X1 = 0, RATE_2X2 = 5, RATE_4X4 = 10 };
+
+  float gaze[3] = { 0.f, 0.f, -1.f };
+  bool eyeTracked = false;
+
+  if (state.foveationMode == FOVEATION_EYE_TRACKED) {
+    float position[3], orientation[4];
+    float head[4], inverseHead[4];
+    quat_init(head, &views[0].pose.orientation.x);
+    quat_init(inverseHead, head);
+    quat_conjugate(inverseHead);
+
+    // The last valid gaze is stored relative to the head, and reused while the gaze is lost
+    // (e.g. blinks), so it keeps following head movement
+    if (lovrHeadsetGetPose(DEVICE_EYE_GAZE, position, orientation)) {
+      quat_rotate(orientation, gaze);
+      vec3_init(state.lastGaze, gaze);
+      quat_rotate(inverseHead, state.lastGaze);
+      state.lastGazeValid = true;
+      eyeTracked = true;
+    } else if (state.lastGazeValid) {
+      vec3_init(gaze, state.lastGaze);
+      quat_rotate(head, gaze);
+      eyeTracked = true;
+    }
+  }
+
+  // Without eye tracking, the full rate region is bigger to leave room for eye movement
+  float margin = eyeTracked ? 0.f : 10.f;
+  float cosInner = cosf(MIN(angles[state.foveationLevel][0] + margin, 180.f) * (float) M_PI / 180.f);
+  float cosOuter = cosf(MIN(angles[state.foveationLevel][1] + margin, 180.f) * (float) M_PI / 180.f);
+
+  GraphicsLimits limits;
+  lovrGraphicsGetLimits(&limits);
+
+  const TextureInfo* info = lovrTextureGetInfo(state.shadingRateTexture);
+  uint32_t width = info->width;
+  uint32_t height = info->height;
+  bool layered = info->layers > 1;
+  uint8_t* data = lovrImageGetLayerData(state.shadingRateImage, 0, 0);
+
+  // Size of a shading rate texel, relative to the viewport
+  float du = (float) limits.shadingRateTexelSize[0] / state.width;
+  float dv = (float) limits.shadingRateTexelSize[1] / state.height;
+
+  for (uint32_t i = 0; i < count; i++) {
+    float direction[3] = { 0.f, 0.f, -1.f };
+
+    if (eyeTracked) {
+      float inverse[4];
+      quat_init(inverse, &views[i].pose.orientation.x);
+      quat_conjugate(inverse);
+      vec3_init(direction, gaze);
+      quat_rotate(inverse, direction);
+
+      // If the gaze points away from this view, use its center
+      if (direction[2] >= 0.f) {
+        vec3_set(direction, 0.f, 0.f, -1.f);
+      }
+    }
+
+    float left = tanf(views[i].fov.angleLeft);
+    float right = tanf(views[i].fov.angleRight);
+    float up = tanf(views[i].fov.angleUp);
+    float down = tanf(views[i].fov.angleDown);
+
+    for (uint32_t y = 0; y < height; y++) {
+      float ty = up - (y + .5f) * dv * (up - down);
+      for (uint32_t x = 0; x < width; x++) {
+        float tx = left + (x + .5f) * du * (right - left);
+        float texel[3] = { tx, ty, -1.f };
+        float cosine = vec3_dot(vec3_normalize(texel), direction);
+        uint8_t rate = cosine >= cosInner ? RATE_1X1 : (cosine >= cosOuter ? RATE_2X2 : RATE_4X4);
+
+        // When all views share a layer, use the finest rate of any view
+        uint8_t* texelRate = &data[y * width + x];
+        *texelRate = (layered || i == 0) ? rate : MIN(*texelRate, rate);
+      }
+    }
+
+    if (layered || i == count - 1) {
+      uint32_t dstOffset[4] = { 0, 0, layered ? i : 0, 0 };
+      uint32_t srcOffset[4] = { 0, 0, 0, 0 };
+      uint32_t extent[3] = { width, height, 1 };
+      if (!lovrTextureSetPixels(state.shadingRateTexture, state.shadingRateImage, dstOffset, srcOffset, extent)) {
+        lovrLog(LOG_WARN, "XR", "Failed to update foveation shading rate: %s", lovrGetError());
+        return;
+      }
+    }
+  }
+}
+
 static bool createSwapchains(void) {
   uint32_t width = state.width;
   uint32_t height = state.height;
@@ -3822,6 +4005,53 @@ static bool createSwapchains(void) {
 
   if (state.extensions.depth && !lovrSwapchainInit(&state.swapchains[SWAPCHAIN_DEPTH], width, height, VIEW | DEPTH)) {
     return false;
+  }
+
+  lovrRelease(state.shadingRateTexture, lovrTextureDestroy);
+  lovrRelease(state.shadingRateImage, lovrImageDestroy);
+  state.shadingRateTexture = NULL;
+  state.shadingRateImage = NULL;
+
+  if (state.shadingRate) {
+    GraphicsLimits limits;
+    lovrGraphicsGetLimits(&limits);
+
+    // Each texel of the shading rate texture controls the shading rate of a tile of pixels.  If
+    // the GPU does not support layered shading rate textures, all views share a single layer.
+    bool layered = state.viewCount > 1 && state.shadingRateLayered;
+    uint32_t layers = layered ? state.viewCount : 1;
+    uint32_t mapWidth = (width + limits.shadingRateTexelSize[0] - 1) / limits.shadingRateTexelSize[0];
+    uint32_t mapHeight = (height + limits.shadingRateTexelSize[1] - 1) / limits.shadingRateTexelSize[1];
+
+    state.shadingRateTexture = lovrTextureCreate(&(TextureInfo) {
+      .type = layered ? TEXTURE_ARRAY : TEXTURE_2D,
+      .format = FORMAT_R8,
+      .width = mapWidth,
+      .height = mapHeight,
+      .layers = layers,
+      .mipmaps = 1,
+      .samples = 1,
+      .usage = TEXTURE_SHADING_RATE | TEXTURE_TRANSFER,
+      .label = "Foveation Shading Rate"
+    });
+
+    if (!state.shadingRateTexture) {
+      return false;
+    }
+
+    state.shadingRateImage = lovrImageCreateRaw(mapWidth, mapHeight, FORMAT_R8, false);
+
+    // Start at full rate, the map is only updated while foveation is active
+    memset(lovrImageGetLayerData(state.shadingRateImage, 0, 0), 0, mapWidth * mapHeight);
+
+    for (uint32_t i = 0; i < layers; i++) {
+      uint32_t dstOffset[4] = { 0, 0, i, 0 };
+      uint32_t srcOffset[4] = { 0, 0, 0, 0 };
+      uint32_t extent[3] = { mapWidth, mapHeight, 1 };
+      if (!lovrTextureSetPixels(state.shadingRateTexture, state.shadingRateImage, dstOffset, srcOffset, extent)) {
+        return false;
+      }
+    }
   }
 
   // Pre-initialize layer structs
